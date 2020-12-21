@@ -1,0 +1,468 @@
+---
+title: "Titanic"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+
+
+```{r}
+rm(list = ls())
+library(tidyverse)
+library(ggthemes)
+library(mice)
+library(caret)
+library(caretEnsemble)
+library(xgboost)
+library(parallel)
+```
+
+```{r}
+theme_set(theme_fivethirtyeight())
+```
+
+
+```{r}
+titanic_train <- read.csv("../Data/Titanic/train.csv", na.strings = "") %>% glimpse()
+titanic_test <- read.csv("../Data/Titanic/test.csv", na.strings = "") %>% glimpse()
+
+df_titanic <- bind_rows(titanic_train, titanic_test)
+```
+
+
+# Data Exploration
+```{r}
+skimr::skim(df_titanic)
+```
+
+
+## Names
+```{r}
+df_titanic$Name[1:20]
+```
+
+```{r}
+df_titanic$Title <- str_extract(df_titanic$Name, regex("M\\w*\\.")) %>%
+  str_extract(., regex("\\w*")) %>%
+  factor() %>%
+  fct_explicit_na(., "Other") %>%
+  fct_collapse(., "Miss" = c("Mlle", "Ms"), "Mrs" = "Mme", "Other" = "Major")
+```
+
+
+```{r eval=FALSE}
+titanic_test$Title <- str_extract(titanic_test$Name, regex("M\\w*\\.")) %>%
+  str_extract(., regex("\\w*")) %>%
+  factor() %>%
+  fct_explicit_na(., "Other") %>%
+  fct_collapse(., "Miss" = c("Mlle", "Ms"), "Mrs" = "Mme", "Other" = "Major")
+```
+
+
+
+
+## Cabin
+```{r}
+df_titanic$Survived <- factor(df_titanic$Survived)
+
+df_titanic$Deck <- str_sub(df_titanic$Cabin, 0, 1) %>% factor()
+```
+
+
+```{r eval=FALSE}
+titanic_test$Deck <- str_sub(titanic_test$Cabin, 0, 1) %>% factor()
+```
+
+```{r}
+df_titanic %>% 
+  filter(Deck == "T")
+```
+
+
+
+```{r}
+df_titanic %>% 
+  filter(!is.na(Deck) & !is.na(Survived)) %>% 
+  group_by(Deck) %>% 
+  count(Survived) %>% 
+  ggplot(aes(Deck, n, fill = Survived))+
+  geom_col()
+```
+
+```{r}
+df_titanic %>% 
+  filter(!is.na(Embarked) & !is.na(Deck) & !is.na(Survived)) %>% 
+  mutate(Pclass = factor(Pclass)) %>% 
+  group_by(Deck) %>% 
+  count(Survived, Pclass) %>% 
+  ggplot(aes(Deck, n, fill = Pclass))+
+  geom_col() +
+  geom_text(
+      aes(label = n, accuracy = .1),
+      position = position_stack(), 
+      size = 2.5, vjust=2
+    ) +
+  facet_wrap(Survived~., scales = "free") 
+```
+
+```{r}
+df_titanic$Deck <- fct_collapse(
+  df_titanic$Deck,
+  "ABC" = c("A", "B", "C", "T"),
+  "DE" = c("D", "E"),
+  "FG" = c("F", "G"))
+```
+
+
+## Fare
+
+```{r}
+df_titanic %>% 
+  filter(is.na(Fare))
+```
+
+
+
+```{r}
+df_titanic$Fare[is.na(df_titanic$Fare)] <- df_titanic %>% 
+  filter(!is.na(Embarked) & Pclass == 3 & Embarked == "S" & SibSp == 0) %>% 
+  group_by(Pclass, Embarked) %>% 
+  summarise(median(Fare, na.rm = TRUE)) %>% 
+  .[[3]]
+```
+
+
+## Age
+
+```{r}
+df_titanic %>%
+  filter(!is.na(Survived)) %>% 
+  ggplot(aes(Age, fill = Survived)) +
+  geom_histogram(col = "white") +
+  scale_x_continuous(breaks = c(seq(0, 80, 5)))
+```
+
+
+
+
+
+```{r}
+df_titanic %>%
+  filter(!is.na(Survived)) %>% 
+  mutate(Pclass = factor(Pclass)) %>% 
+  ggplot(aes(Sex, Age, fill = Sex)) +
+  geom_violin() +
+  geom_jitter(width = 0.3, alpha = 0.3) +
+  facet_grid(Survived ~ Pclass) +
+  scale_y_continuous(breaks = seq(0, 80, 10)) +
+  theme_bw()
+```
+
+
+
+
+```{r}
+df_titanic %>%
+  filter(!is.na(Age) & !is.na(Survived) & Fare < 200) %>% 
+  ggplot(aes(Age, Fare, color = factor(Pclass))) +
+  geom_point() +
+  geom_smooth() +
+  facet_wrap(Survived ~ .) +
+  scale_x_continuous(breaks = c(seq(0, 80, 10))) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+
+
+```{r}
+library(missForest)
+set.seed(6)
+df_titanic_imput <- missForest(df_titanic %>% select(-c(PassengerId, Name, Ticket,Cabin, Survived)))$ximp
+df_titanic_imput$Survived <- df_titanic$Survived
+```
+
+
+
+```{r}
+df_titanic_imput$Child <- ifelse(df_titanic_imput$Age < 16, "child", "notChild") %>% factor()
+df_titanic_imput$Family <- df_titanic_imput$SibSp + df_titanic_imput$Parch + 1
+df_titanic_imput$Family <- ifelse(df_titanic_imput$Family == 1, "Single", "NotSingle") %>% factor()
+df_titanic_imput$Pclass <- factor(df_titanic_imput$Pclass)
+df_titanic_imput$Parch <- factor(df_titanic_imput$Parch )
+df_titanic_imput$SibSp <- factor(df_titanic_imput$SibSp )
+```
+
+
+
+
+
+
+```{r}
+df_titanic_imput <- df_titanic_imput %>%
+  mutate(Age_fct = case_when(
+    Age < 17 ~ 1,
+    Age >= 17 & Age < 25 ~ 2,
+    Age >= 25 & Age < 34 ~ 3,
+    Age >= 34 & Age < 48 ~ 4,
+    #Age >= 39 & Age < 48 ~ 6,
+    Age >= 48 ~ 5,
+  ) %>% factor() )
+
+table(df_titanic_imput$Age_fct)
+```
+
+```{r}
+df_titanic_imput <- df_titanic_imput %>%
+  mutate(Fare_fct = case_when(
+    Fare <= 7.91 ~ 1,
+    Fare > 7.91 & Fare <= 14.454 ~ 2,
+    Fare > 14.454 & Fare <= 31 ~ 3,
+    Fare > 31 ~ 4
+  )%>% factor() )
+
+table(df_titanic_imput$Fare_fct)
+```
+
+```{r}
+df_titanic_imput$Pclass <- relevel(df_titanic_imput$Pclass , "2")
+df_titanic_imput$Sex <- relevel(df_titanic_imput$Sex , "male")
+df_titanic_imput$Embarked <- relevel(df_titanic_imput$Embarked , "S")
+df_titanic_imput$Title <- relevel(df_titanic_imput$Title , "Miss")
+df_titanic_imput$Deck <- relevel(df_titanic_imput$Deck , "FG")
+df_titanic_imput$Fare_fct <- relevel(df_titanic_imput$Fare_fct , "3")
+df_titanic_imput$Survived <- relevel(df_titanic_imput$Survived , "1")
+```
+
+
+
+# Modèle
+
+```{r}
+titanic_train2 <- df_titanic_imput[1:891,] %>% select(-c(Age, Fare))
+titanic_test2 <- df_titanic_imput[892:1309,] %>% select(-c(Survived,Age, Fare))
+```
+
+
+## RandomForest
+```{r}
+fitControl <- trainControl(
+  method = "cv",
+  number = 5,
+  repeats = 3,
+  allowParallel = TRUE,
+)
+
+set.seed(6)
+n_cores <- parallel::detectCores() - 1
+c1 <- parallel::makePSOCKcluster(n_cores)
+doParallel::registerDoParallel(c1)
+titanic_rf <- train(
+  Survived~., data = titanic_train2,
+  trControl = fitControl,
+  tuneGrid = expand.grid(mtry = 2:10),
+  method = "rf" , 
+  preProcess= c("center", "scale")
+)
+parallel::stopCluster(c1)
+```
+
+
+## Confusion Matrix
+```{r}
+titanic_rf$finalModel
+```
+
+```{r}
+titanic_rf$results
+```
+
+```{r}
+varImp(titanic_rf)
+```
+
+```{r}
+confusionMatrix(
+  data = predict(titanic_rf, titanic_train2),
+  reference = titanic_train2$Survived
+)
+```
+
+
+
+```{r}
+titanic_predict <- predict(titanic_rf, titanic_test2)
+titanic_submit <- data.frame(PassengerId = titanic_test$PassengerId, Survived = titanic_predict)
+
+write.csv(titanic_submit, "titanic_submit.csv", row.names = FALSE)
+```
+
+```{r}
+df_test <- cbind("Survived" = titanic_predict, titanic_test)
+df_test <- rbind(titanic_train, df_test)
+
+df_test %>% 
+  filter(Survived==1) %>% 
+  janitor::tabyl(Survived, Pclass) %>% 
+  janitor::adorn_totals(where = "col")
+```
+
+202 115 178 495
+
+
+
+
+```{r eval=FALSE}
+titanic_train2$Pclass <- factor(titanic_train2$Pclass)
+temp <- dummyVars(Survived ~ ., data = titanic_train2, fullRank = TRUE)
+titanic_train2 <- cbind("Survived" = titanic_train2$Survived, data.frame(predict(temp, newdata = titanic_train2)))
+#-------------------#
+titanic_train2$Sex <- fct_recode(titanic_train2$Sex, "1" = "female", "2" = "male") %>% as.numeric()
+titanic_train2$Embarked <- fct_recode(titanic_train2$Embarked, "1" = "C", "2" = "Q", "3" = "S") %>% as.numeric()
+titanic_train2$Title <- fct_recode(titanic_train2$Title,
+  "1" = "Master", "2" = "Miss",
+  "3" = "Mr", "4" = "Mrs", "5" = "Other"
+) %>% as.numeric()
+
+titanic_train2$Family <- fct_recode(titanic_train2$Family, "0" = "Single", "1" = "NotSingle") %>% as.numeric()
+```
+
+
+
+
+```{r eval=FALSE}
+titanic_train$Ticket_Number <- str_extract(titanic_train$Ticket, "\\d+\\d") %>%
+  as.numeric() %>%
+  na_if(" ") %>%
+  str_c(titanic_train$PassengerId)
+
+titanic_train %>%
+  select(PassengerId, Pclass, Cabin, Age, Ticket_Number) %>%
+  arrange(Ticket_Number)
+
+titanic_train$Ticket %>% head(240)
+
+test <- str_extract(titanic_train$Ticket, regex("[^\\d\\s]*")) %>%
+  str_replace_all(., "[[:punct:]]", "") %>%
+  factor() %>%
+  na_if(" ")
+
+table(test)
+```
+
+
+
+```{r eval=FALSE}
+titanic_train <- titanic_train %>%
+  mutate(Fare = case_when(
+    Fare <= 7.91 ~ 1,
+    Fare > 7.91 & Fare <= 14.454 ~ 2,
+    Fare > 14.454 & Fare <= 31 ~ 3,
+    Fare > 31 ~ 4
+  ))
+
+titanic_test <- titanic_test %>%
+  mutate(Fare = case_when(
+    Fare <= 7.91 ~ 1,
+    Fare > 7.91 & Fare <= 14.454 ~ 2,
+    Fare > 14.454 & Fare <= 31 ~ 3,
+    Fare > 31 ~ 4
+  ))
+```
+
+
+```{r eval=FALSE}
+titanic_train2 <- model.matrix(Survived ~ ., titanic_train2)[, -1] %>%
+  data.frame() %>%
+  cbind(Survived = titanic_train2$Survived, .)
+
+titanic_test2 <- model.matrix(Age ~ ., titanic_test2)[, -1] %>%
+  data.frame() %>%
+  cbind(Age = titanic_test2$Age, .)
+```
+
+
+
+```{r eval=FALSE}
+X_train <- as.matrix(titanic_train2 %>% select(-Survived) %>% mutate_if(is.factor, as.numeric))
+y_train <- titanic_train2$Survived
+X_test <- as.matrix(titanic_test2 %>% mutate_if(is.factor, as.numeric))
+
+
+
+xgb_grid <- expand.grid(
+  nrounds = seq(from = 200, to = 1000, by = 100),
+  max_depth = c(2, 3, 4, 5, 6),
+  eta = c(0.025, 0.05, 0.1, 0.3),
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+
+gbm_grid <- expand.grid(
+  interaction.depth = c(1, 2, 3),
+  n.trees = (1:30) * 100,
+  shrinkage = c(0.1, 0.3),
+  n.minobsinnode = 20
+)
+```
+
+
+```{r eval=FALSE}
+set.seed(6)
+n_cores <- parallel::detectCores() - 1
+c1 <- parallel::makePSOCKcluster(n_cores)
+doParallel::registerDoParallel(c1)
+titanic_xgb <- train(
+  x = X_train,
+  y = y_train,
+  trControl = fitControl,
+  tuneGrid = xgb_grid,
+  method = "xgbTree"
+)
+parallel::stopCluster(c1)
+
+set.seed(41)
+n_cores <- parallel::detectCores() - 1
+c1 <- parallel::makePSOCKcluster(n_cores)
+doParallel::registerDoParallel(c1)
+titanic_gbm <- train(
+  x = X_train,
+  y = y_train,
+  trControl = fitControl,
+  tuneGrid = gbm_grid,
+  method = "gbm"
+)
+parallel::stopCluster(c1)
+
+confusionMatrix(
+  data = predict(titanic_xgb, X_train),
+  reference = y_train
+)
+
+confusionMatrix(
+  data = predict(titanic_gbm, X_train),
+  reference = y_train
+)
+
+titanic_predict_xgb <- predict(titanic_xgb, X_test)
+
+prop.table(table(titanic_predict_xgb))
+```
+
+```{r eval=FALSE}
+set.seed(3456)
+library(mice)
+titanic_train <- mice(titanic_train %>% select(-c(Name, Ticket)), method = "rf") %>% complete()
+titanic_test <- mice(titanic_test %>% select(-c(Name, Ticket)), method = "rf") %>% complete()
+
+write.csv(titanic_train2, "../Data/Titanic/train_complet.csv", row.names = FALSE)
+write.csv(titanic_test2, "../Data/Titanic/test_complet.csv", row.names = FALSE)
+
+titanic_train <- read.csv("../Data/Titanic/train_complet.csv", na.strings = "") %>% glimpse()
+titanic_test <- read.csv("../Data/Titanic/test_complet.csv", na.strings = "") %>% glimpse()
+```
